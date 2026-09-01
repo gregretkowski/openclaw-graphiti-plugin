@@ -26,6 +26,17 @@ export interface ContextEngineInfo {
   name: string;
   version: string;
   ownsCompaction: boolean;
+  /**
+   * Durable-commit contract declarations (openclaw/plugin-sdk
+   * context-engine/types.ts). Hosts with a turn recorder require both the
+   * current-turn transcript fence and atomic-idempotent turn advancement
+   * before selecting a non-baseline engine; missing declarations degrade the
+   * engine to legacy for the turn.
+   */
+  transcriptSemantics?: {
+    currentTurnFence?: "before-current-turn-entry-v1";
+    turnAdvancementIdempotency?: "atomic-idempotent-v1";
+  };
 }
 
 export interface IngestResult {
@@ -34,6 +45,10 @@ export interface IngestResult {
 
 export interface IngestBatchResult {
   ingestedCount: number;
+}
+
+export interface CommitTurnResult {
+  status: "committed" | "duplicate";
 }
 
 export interface AssembleResult {
@@ -81,6 +96,10 @@ export class GraphitiContextEngine {
     name: "Graphiti Knowledge Graph",
     version: PLUGIN_VERSION,
     ownsCompaction: false,
+    transcriptSemantics: {
+      currentTurnFence: "before-current-turn-entry-v1",
+      turnAdvancementIdempotency: "atomic-idempotent-v1",
+    },
   };
 
   /** Cached healthy() result with TTL to avoid redundant HTTP round-trips. */
@@ -93,6 +112,10 @@ export class GraphitiContextEngine {
   private _sessionId: string | null = null;
   private _threadId: string | null = null;
   private _recalledSessions = new Set<string>();
+  /** Advancement keys committed this process (durable idempotency layer 1). */
+  private _committedTurns = new Set<string>();
+  /** True once the host has invoked commitTurn — capture moves to that path. */
+  private _durableMode = false;
 
   constructor(
     private client: GraphitiClient,
@@ -192,6 +215,8 @@ export class GraphitiContextEngine {
     messages: unknown[];
     tokenBudget?: number;
     threadId?: string;
+    /** The incoming user prompt for this turn (sanctioned fence channel). */
+    prompt?: string;
   }): Promise<AssembleResult> {
     const passThrough: AssembleResult = { messages: params.messages };
     const start = Date.now();
@@ -212,7 +237,10 @@ export class GraphitiContextEngine {
 
       if (params.threadId) this._threadId = params.threadId;
 
-      const lastUserText = this.extractLastUserText(params.messages);
+      // Fence: the current turn's user entry arrives via the sanctioned
+      // `prompt` channel; only fall back to the window tail when the host
+      // does not provide it (non-durable path).
+      const lastUserText = params.prompt || this.extractLastUserText(params.messages);
       const gapDetected = isContinuityGap(params.messages.length, { recentEvent: this._lastEvent });
       const deicticDetected = !!lastUserText && hasDeicticReferences(lastUserText);
 
@@ -243,6 +271,9 @@ export class GraphitiContextEngine {
       let continuityTail: string | null = null;
       if (this._sessionFile) {
         continuityTail = await readSessionFileTail(this._sessionFile);
+        if (continuityTail && params.prompt) {
+          continuityTail = this.stripTrailingPrompt(continuityTail, params.prompt);
+        }
         if (continuityTail) {
           continuityBlock = formatContinuityBlock(continuityTail);
         }
@@ -271,7 +302,16 @@ export class GraphitiContextEngine {
           semanticBlock = formatFactsAsContext(facts);
         }
       } else {
-        const graphitiMessages = this.buildGraphitiMessages(params.messages);
+        // Fence: drop a trailing current-turn user entry so recall reads
+        // only pre-fence transcript.
+        let recallWindow = params.messages;
+        if (params.prompt) {
+          const last = recallWindow[recallWindow.length - 1];
+          if (last && typeof last === "object" && (last as { role?: unknown }).role === "user") {
+            recallWindow = recallWindow.slice(0, -1);
+          }
+        }
+        const graphitiMessages = this.buildGraphitiMessages(recallWindow);
         if (graphitiMessages.length > 0) {
           const facts = await this.client.getMemory(graphitiMessages, maxFacts);
           if (facts.length > 0) {
@@ -348,6 +388,18 @@ export class GraphitiContextEngine {
       return extractTextContent(m.content, 1);
     }
     return null;
+  }
+
+  /**
+   * Fence helper: remove a trailing occurrence of the current turn's prompt
+   * text from a session-file tail so continuity recovery never reads past
+   * the current-turn entry. No-op when the tail does not contain the prompt.
+   */
+  private stripTrailingPrompt(tail: string, prompt: string): string {
+    if (!prompt) return tail;
+    const idx = tail.lastIndexOf(prompt);
+    if (idx === -1) return tail;
+    return tail.slice(0, idx).replace(/\s+$/, "");
   }
 
   /**
@@ -487,6 +539,15 @@ export class GraphitiContextEngine {
     if (params.sessionFile) this._sessionFile = params.sessionFile;
     if (params.sessionId) this._sessionId = params.sessionId;
 
+    // Durable-commit hosts capture turns in commitTurn (exactly-once per
+    // advancementKey); afterTurn remains the capture point for non-durable
+    // hosts. Boundary note: the first durable turn may already have been
+    // captured here before the first commitTurn flips _durableMode.
+    if (this._durableMode) {
+      this.debugLog.log("ce-afterTurn", { skipped: true, reason: "durable_commit_turn" });
+      return;
+    }
+
     if (this.cfg.autoCapture === false) {
       this.debugLog.log("ce-afterTurn", { skipped: true, reason: "autoCapture_disabled" });
       return;
@@ -563,6 +624,92 @@ export class GraphitiContextEngine {
       this.logger?.warn(`graphiti: afterTurn failed: ${String(err)}`);
       this.debugLog.log("ce-afterTurn", { error: String(err) });
     }
+  }
+
+  /**
+   * Durable turn advancement (durable-commit hosts only).
+   *
+   * Contract: atomically and idempotently commit one accepted durable
+   * transcript turn. `messages` span the admitted user entry through the
+   * accepted terminal entry; hosts may retry the same `advancementKey`
+   * after process or plugin failure.
+   *
+   * Idempotency is layered:
+   *   1. In-process: bounded Set of advancement keys
+   *   2. Cross-restart: deterministic episode name (turn-commit-<key>)
+   *      checked against the most recent 100 episodes before capture
+   *
+   * Capture errors propagate (and the key is NOT recorded as committed)
+   * so the host outbox retries the advancement; no-content / no-capture
+   * turns ack "committed" without touching the graph.
+   */
+  async commitTurn(params: {
+    advancementKey: string;
+    admission?: unknown;
+    terminal?: unknown;
+    messages: Array<{ role: string; content: unknown }>;
+    sessionId: string;
+    sessionKey?: string;
+    isHeartbeat?: boolean;
+  }): Promise<CommitTurnResult> {
+    const key = params.advancementKey;
+    this._durableMode = true;
+
+    if (this._committedTurns.has(key)) {
+      this.debugLog.log("ce-commitTurn", { key, status: "duplicate", reason: "in_process" });
+      return { status: "duplicate" };
+    }
+
+    const episodeName = `turn-commit-` + key;
+    try {
+      const recent = await this.client.episodes(100);
+      if (recent.some((ep) => ep.name === episodeName)) {
+        this._committedTurns.add(key);
+        this.debugLog.log("ce-commitTurn", { key, status: "duplicate", reason: "episode_exists" });
+        return { status: "duplicate" };
+      }
+    } catch (err) {
+      // Episode scan is best-effort dedup; fall through to capture.
+      this.debugLog.log("ce-commitTurn", { key, episodeScan: "failed", error: String(err) });
+    }
+
+    if (this.cfg.autoCapture === false || params.isHeartbeat) {
+      this._committedTurns.add(key);
+      this.debugLog.log("ce-commitTurn", {
+        key,
+        status: "committed",
+        captured: false,
+        reason: params.isHeartbeat ? "heartbeat" : "autoCapture_disabled",
+      });
+      return { status: "committed" };
+    }
+
+    const texts = extractTextsFromMessages(params.messages);
+    const joined = texts.length > 0 ? sanitizeForCapture(texts.join("\n\n")) : null;
+    if (!joined) {
+      this._committedTurns.add(key);
+      this.debugLog.log("ce-commitTurn", { key, status: "committed", captured: false, reason: "no_content" });
+      return { status: "committed" };
+    }
+
+    // Errors must propagate: the host re-queues failed advancements.
+    await this.client.ingest([{
+      content: joined.slice(0, 12000),
+      role_type: "user",
+      role: "conversation",
+      name: episodeName,
+      timestamp: new Date().toISOString(),
+      source_description: buildProvenance(this.groupId, {
+        event: "commit_turn",
+        session_key: params.sessionKey ?? params.sessionId,
+        thread_id: this._threadId ?? undefined,
+      }),
+    }]);
+
+    if (this._committedTurns.size >= 5000) this._committedTurns.clear();
+    this._committedTurns.add(key);
+    this.debugLog.log("ce-commitTurn", { key, status: "committed", captured: true, chars: joined.length });
+    return { status: "committed" };
   }
 
   /**
