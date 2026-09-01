@@ -4,6 +4,20 @@
   "skills": ["./skills"],
   "name": "Graphiti Knowledge Graph",
   "description": "Temporal knowledge graph for persistent agent memory. Auto-recalls relevant facts before each conversation and captures knowledge after.",
+  "contracts": {
+    "tools": [
+      "graphiti_search",
+      "graphiti_ingest",
+      "graphiti_forget",
+      "graphiti_episodes"
+    ]
+  },
+  "toolMetadata": {
+    "graphiti_search": { "profiles": ["coding", "full"] },
+    "graphiti_ingest": { "profiles": ["coding", "full"] },
+    "graphiti_forget": { "profiles": ["coding", "full"] },
+    "graphiti_episodes": { "profiles": ["coding", "full"] }
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
